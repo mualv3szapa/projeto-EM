@@ -1,0 +1,13 @@
+project_id = "quytridbcenewsifvtuz"
+
+[functions.sensor-data]
+verify_jwt = false
+
+[functions.device-commands]
+verify_jwt = false
+
+[functions.irrigation-payload]
+verify_jwt = false
+
+[functions.mqtt-command]
+verify_jwt = false
