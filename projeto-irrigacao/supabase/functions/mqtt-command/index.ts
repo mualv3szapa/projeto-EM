@@ -1,141 +1,250 @@
-import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
 const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
+};
+
+const MQTT_HOST = "iotmqtt.santoandre.sp.gov.br";
+const MQTT_PORT = 1883;
+const MQTT_TOPIC = "PSA/Executivo/AutomacaoPredial/irrigador/planta1/cmnd";
+
+function encodeRemainingLength(length: number): number[] {
+  const encoded: number[] = [];
+
+  do {
+    let digit = length % 128;
+    length = Math.floor(length / 128);
+
+    if (length > 0) {
+      digit = digit | 0x80;
+    }
+
+    encoded.push(digit);
+  } while (length > 0);
+
+  return encoded;
 }
 
-const MQTT_HOST = 'iotmqtt.santoandre.sp.gov.br'
-const MQTT_PORT = 1883
-const MQTT_TOPIC = 'PSA/Executivo/AutomacaoPredial/irrigador/planta1/comando'
+function buildConnectPacket(
+  clientId: string,
+  username?: string,
+  password?: string,
+): Uint8Array {
+  const protocolName = new TextEncoder().encode("MQTT");
+  const clientIdBytes = new TextEncoder().encode(clientId);
 
-// Minimal MQTT packet builders (protocol level 4 = MQTT 3.1.1)
-function buildConnectPacket(clientId: string): Uint8Array {
-  const protocolName = new TextEncoder().encode('MQTT')
-  const clientIdBytes = new TextEncoder().encode(clientId)
+  const usernameBytes = username ? new TextEncoder().encode(username) : null;
+  const passwordBytes = password ? new TextEncoder().encode(password) : null;
 
-  const variableHeaderLen = 2 + protocolName.length + 1 + 1 + 2 // protocol name + level + flags + keepalive
-  const payloadLen = 2 + clientIdBytes.length
-  const remainingLength = variableHeaderLen + payloadLen
+  let connectFlags = 0x02; // clean session
 
-  const packet = new Uint8Array(2 + remainingLength)
-  let i = 0
+  if (usernameBytes) connectFlags |= 0x80;
+  if (passwordBytes) connectFlags |= 0x40;
 
-  // Fixed header
-  packet[i++] = 0x10 // CONNECT
-  packet[i++] = remainingLength
+  const variableHeaderLen = 2 + protocolName.length + 1 + 1 + 2;
 
-  // Variable header
-  packet[i++] = 0x00
-  packet[i++] = protocolName.length
-  packet.set(protocolName, i); i += protocolName.length
-  packet[i++] = 0x04 // Protocol level (MQTT 3.1.1)
-  packet[i++] = 0x02 // Connect flags (clean session)
-  packet[i++] = 0x00 // Keep alive MSB
-  packet[i++] = 0x3C // Keep alive LSB (60s)
+  let payloadLen = 2 + clientIdBytes.length;
 
-  // Payload
-  packet[i++] = (clientIdBytes.length >> 8) & 0xFF
-  packet[i++] = clientIdBytes.length & 0xFF
-  packet.set(clientIdBytes, i)
+  if (usernameBytes) payloadLen += 2 + usernameBytes.length;
+  if (passwordBytes) payloadLen += 2 + passwordBytes.length;
 
-  return packet
+  const remainingLength = variableHeaderLen + payloadLen;
+  const encodedRemaining = encodeRemainingLength(remainingLength);
+
+  const packet = new Uint8Array(1 + encodedRemaining.length + remainingLength);
+
+  let i = 0;
+
+  packet[i++] = 0x10;
+
+  for (const b of encodedRemaining) {
+    packet[i++] = b;
+  }
+
+  packet[i++] = 0x00;
+  packet[i++] = protocolName.length;
+
+  packet.set(protocolName, i);
+  i += protocolName.length;
+
+  packet[i++] = 0x04;
+  packet[i++] = connectFlags;
+
+  packet[i++] = 0x00;
+  packet[i++] = 0x3c;
+
+  packet[i++] = (clientIdBytes.length >> 8) & 0xff;
+  packet[i++] = clientIdBytes.length & 0xff;
+
+  packet.set(clientIdBytes, i);
+  i += clientIdBytes.length;
+
+  if (usernameBytes) {
+    packet[i++] = (usernameBytes.length >> 8) & 0xff;
+    packet[i++] = usernameBytes.length & 0xff;
+
+    packet.set(usernameBytes, i);
+    i += usernameBytes.length;
+  }
+
+  if (passwordBytes) {
+    packet[i++] = (passwordBytes.length >> 8) & 0xff;
+    packet[i++] = passwordBytes.length & 0xff;
+
+    packet.set(passwordBytes, i);
+    i += passwordBytes.length;
+  }
+
+  return packet;
 }
 
 function buildPublishPacket(topic: string, message: string): Uint8Array {
-  const topicBytes = new TextEncoder().encode(topic)
-  const messageBytes = new TextEncoder().encode(message)
+  const topicBytes = new TextEncoder().encode(topic);
+  const messageBytes = new TextEncoder().encode(message);
 
-  const remainingLength = 2 + topicBytes.length + messageBytes.length
+  const remainingLength = 2 + topicBytes.length + messageBytes.length;
+  const encodedRemaining = encodeRemainingLength(remainingLength);
 
-  // Handle remaining length encoding (up to 127 for simplicity)
-  const packet = new Uint8Array(2 + remainingLength)
-  let i = 0
+  const packet = new Uint8Array(1 + encodedRemaining.length + remainingLength);
 
-  packet[i++] = 0x30 // PUBLISH, QoS 0
-  packet[i++] = remainingLength
+  let i = 0;
 
-  packet[i++] = (topicBytes.length >> 8) & 0xFF
-  packet[i++] = topicBytes.length & 0xFF
-  packet.set(topicBytes, i); i += topicBytes.length
-  packet.set(messageBytes, i)
+  packet[i++] = 0x30;
 
-  return packet
+  for (const b of encodedRemaining) {
+    packet[i++] = b;
+  }
+
+  packet[i++] = (topicBytes.length >> 8) & 0xff;
+  packet[i++] = topicBytes.length & 0xff;
+
+  packet.set(topicBytes, i);
+  i += topicBytes.length;
+
+  packet.set(messageBytes, i);
+
+  return packet;
 }
 
 function buildDisconnectPacket(): Uint8Array {
-  return new Uint8Array([0xE0, 0x00])
+  return new Uint8Array([0xe0, 0x00]);
 }
 
-async function publishMqtt(topic: string, message: string): Promise<void> {
-  const conn = await Deno.connect({ hostname: MQTT_HOST, port: MQTT_PORT })
+async function publishMqtt(topic: string, message: string) {
+  console.log("Connecting to MQTT broker...");
+
+  const conn = await Deno.connect({
+    hostname: MQTT_HOST,
+    port: MQTT_PORT,
+  });
+
+  const username = Deno.env.get("MQTT_USERNAME");
+  const password = Deno.env.get("MQTT_PASSWORD");
 
   try {
-    // CONNECT
-    const clientId = `lovable-${Date.now()}`
-    await conn.write(buildConnectPacket(clientId))
+    const clientId = `supabase-${Date.now()}`;
 
-    // Wait for CONNACK
-    const buf = new Uint8Array(4)
-    await conn.read(buf)
+    const connectPacket = buildConnectPacket(clientId, username, password);
+
+    await conn.write(connectPacket);
+
+    const buf = new Uint8Array(4);
+    await conn.read(buf);
+
+    console.log("MQTT CONNACK:", buf);
+
     if (buf[0] !== 0x20 || buf[3] !== 0x00) {
-      throw new Error(`MQTT CONNACK failed: ${buf[3]}`)
+      throw new Error(`MQTT connection refused: ${buf[3]}`);
     }
 
-    // PUBLISH
-    await conn.write(buildPublishPacket(topic, message))
+    console.log("MQTT connected");
 
-    // Small delay to ensure delivery
-    await new Promise(r => setTimeout(r, 100))
+    const publishPacket = buildPublishPacket(topic, message);
 
-    // DISCONNECT
-    await conn.write(buildDisconnectPacket())
+    await conn.write(publishPacket);
+
+    console.log("Message published:", message);
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    await conn.write(buildDisconnectPacket());
+
+    console.log("MQTT disconnected");
   } finally {
-    conn.close()
+    conn.close();
   }
 }
 
 serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders })
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
   }
 
   try {
-    if (req.method !== 'POST') {
-      return new Response(
-        JSON.stringify({ error: 'Method not allowed' }),
-        { status: 405, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      )
+    if (req.method !== "POST") {
+      return new Response(JSON.stringify({ error: "Method not allowed" }), {
+        status: 405,
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json",
+        },
+      });
     }
 
-    const { command, plant_id, sensor_id } = await req.json()
+    const { command } = await req.json();
 
-    if (!command || !['irrigar_on', 'irrigar_off'].includes(command)) {
+    if (!command || !["irrigar_on", "irrigar_off"].includes(command)) {
       return new Response(
-        JSON.stringify({ error: 'Invalid command. Use irrigar_on or irrigar_off' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      )
+        JSON.stringify({
+          error: "Invalid command. Use irrigar_on or irrigar_off",
+        }),
+        {
+          status: 400,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        },
+      );
     }
 
-    const message = JSON.stringify({
-      command,
-      plant_id: plant_id || null,
-      sensor_id: sensor_id || null,
-      timestamp: new Date().toISOString(),
-    })
+    const message = command === "irrigar_on" ? "1" : "0";
 
-    console.log(`Publishing to ${MQTT_TOPIC}: ${message}`)
-    await publishMqtt(MQTT_TOPIC, message)
+    console.log(`Publishing to ${MQTT_TOPIC}: ${message}`);
+
+    await publishMqtt(MQTT_TOPIC, message);
 
     return new Response(
-      JSON.stringify({ success: true, topic: MQTT_TOPIC, command }),
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    )
+      JSON.stringify({
+        success: true,
+        topic: MQTT_TOPIC,
+        command,
+      }),
+      {
+        status: 200,
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json",
+        },
+      },
+    );
   } catch (error) {
-    console.error('MQTT publish error:', error)
+    console.error("MQTT publish error:", error);
+
     return new Response(
-      JSON.stringify({ error: 'Failed to publish MQTT command', details: String(error) }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    )
+      JSON.stringify({
+        error: "Failed to publish MQTT command",
+        details: String(error),
+      }),
+      {
+        status: 500,
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json",
+        },
+      },
+    );
   }
-})
+});
